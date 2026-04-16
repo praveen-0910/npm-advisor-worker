@@ -4,6 +4,49 @@ import { z } from "zod";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+interface NpmsPackageFull {
+	analyzedAt: string;
+	collected: {
+		metadata: {
+			name: string;
+			version: string;
+			description?: string;
+			keywords?: string[];
+			date: string;
+			links: { npm: string; homepage?: string; repository?: string };
+		};
+		npm?: {
+			downloads?: { from: string; to: string; count: number }[];
+			starsCount?: number;
+		};
+		github?: {
+			starsCount?: number;
+			forksCount?: number;
+			subscribersCount?: number;
+			issues?: { count: number; openCount: number };
+			contributors?: { username: string; commitsCount: number }[];
+			commits?: { from: string; to: string; count: number }[];
+		};
+		source?: { linters?: string[]; coverage?: number };
+	};
+	score: {
+		final: number;
+		detail: { quality: number; popularity: number; maintenance: number };
+	};
+}
+
+interface NpmDownloadPoint {
+	downloads: number;
+	day: string;
+}
+
+interface NpmDownloadRange {
+	start: string;
+	end: string;
+	package: string;
+	downloads: NpmDownloadPoint[];
+}
+
 interface NpmsPackage {
 	package: {
 		name: string;
@@ -228,8 +271,55 @@ function formatVulnList(vulns: OsvVuln[], limit = 5): string {
 	return lines.join("\n");
 }
 
+// Unicode sparkline from an array of numbers
+function sparkline(values: number[]): string {
+	const chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+	const min = Math.min(...values);
+	const max = Math.max(...values);
+	if (max === min) return chars[3].repeat(values.length);
+	return values
+		.map((v) => chars[Math.floor(((v - min) / (max - min)) * (chars.length - 1))])
+		.join("");
+}
+
+// Growth rate between first and last value
+function growthRate(values: number[]): string {
+	if (values.length < 2) return "N/A";
+	const first = values[0] ?? 1;
+	const last = values[values.length - 1] ?? 0;
+	if (first === 0) return "N/A";
+	const pct = (((last - first) / first) * 100).toFixed(1);
+	return Number(pct) > 0 ? `📈 +${pct}%` : Number(pct) < 0 ? `📉 ${pct}%` : "➡️ Stable";
+}
+
+// Load time estimate string
+function loadTimeMs(gzipBytes: number): string {
+	const g3 = ((gzipBytes / (1000 * 1000 / 8)) * 1000).toFixed(0);   // 1 Mbps
+	const g4 = ((gzipBytes / (10 * 1000 * 1000 / 8)) * 1000).toFixed(0); // 10 Mbps
+	const wifi = ((gzipBytes / (50 * 1000 * 1000 / 8)) * 1000).toFixed(0); // 50 Mbps
+	return `3G: ~${g3}ms | 4G: ~${g4}ms | WiFi: ~${wifi}ms`;
+}
+
+// Check if a semver range is satisfied by a version (simple major/minor check)
+function satisfiesRange(range: string, version: string): boolean {
+	if (range === "*" || range === "latest") return true;
+	const rangeMajor = Number.parseInt(range.replace(/[^\d]/, "")) || 0;
+	const verMajor = Number.parseInt(version) || 0;
+	return verMajor >= rangeMajor;
+}
+
 async function getNpmsData(name: string): Promise<NpmsPackage | null> {
 	return fetchJson<NpmsPackage>(`https://api.npms.io/v2/package/${encodeURIComponent(name)}`);
+}
+
+async function getNpmsDataFull(name: string): Promise<NpmsPackageFull | null> {
+	return fetchJson<NpmsPackageFull>(`https://api.npms.io/v2/package/${encodeURIComponent(name)}`);
+}
+
+async function getDownloadRange(name: string, period: string): Promise<NpmDownloadRange | null> {
+	return fetchJson<NpmDownloadRange>(
+		`https://api.npmjs.org/downloads/range/${period}/${encodeURIComponent(name)}`,
+	);
 }
 
 async function getNpmRegistry(name: string): Promise<NpmRegistry | null> {
@@ -984,6 +1074,653 @@ export class NpmAdvisorMCP extends McpAgent {
 				return { content: [{ type: "text" as const, text: lines }] };
 			},
 		);
+
+		// ── Tool 8: download_trends ──────────────────────────────────────────────
+		this.server.registerTool(
+			"download_trends",
+			{
+				description:
+					"Show 6-month weekly download trend for one or more npm packages with a sparkline chart, growth rate, and rising/falling/stable classification. Great for comparing momentum.",
+				inputSchema: {
+					packages: z
+						.array(z.string())
+						.min(1)
+						.max(5)
+						.describe("Package names to analyze, e.g. ['react', 'vue', 'svelte']"),
+				},
+			},
+			async ({ packages }) => {
+				const sections = await Promise.all(
+					packages.map(async (name) => {
+						// Get ~6 months of daily data, aggregate by week
+						const today = new Date();
+						const sixMonthsAgo = new Date(today);
+						sixMonthsAgo.setMonth(today.getMonth() - 6);
+						const start = sixMonthsAgo.toISOString().split("T")[0];
+						const end = today.toISOString().split("T")[0];
+
+						const range = await getDownloadRange(name, `${start}:${end}`);
+						if (!range || range.downloads.length === 0) {
+							return `### ${name}\n> No download data available`;
+						}
+
+						// Aggregate into weeks
+						const weeks: number[] = [];
+						for (let i = 0; i < range.downloads.length; i += 7) {
+							const slice = range.downloads.slice(i, i + 7);
+							weeks.push(slice.reduce((sum, d) => sum + d.downloads, 0));
+						}
+
+						const totalDownloads = weeks.reduce((a, b) => a + b, 0);
+						const avgWeekly = Math.round(totalDownloads / weeks.length);
+						const peakWeek = Math.max(...weeks);
+						const growth = growthRate(weeks);
+						const spark = sparkline(weeks);
+
+						// Trend classification
+						const recentAvg = weeks.slice(-4).reduce((a, b) => a + b, 0) / 4;
+						const oldAvg = weeks.slice(0, 4).reduce((a, b) => a + b, 0) / 4;
+						const trendLabel =
+							recentAvg > oldAvg * 1.1
+								? "🚀 Growing"
+								: recentAvg < oldAvg * 0.9
+									? "📉 Declining"
+									: "➡️ Stable";
+
+						return [
+							`### ${name}`,
+							`**Trend (weekly, ~6 months):**`,
+							`\`${spark}\``,
+							``,
+							`| Metric | Value |`,
+							`|--------|-------|`,
+							`| Trend | ${trendLabel} |`,
+							`| Growth (first → last week) | ${growth} |`,
+							`| Avg weekly downloads | ${avgWeekly.toLocaleString()} |`,
+							`| Peak week | ${peakWeek.toLocaleString()} |`,
+							`| Total (6 months) | ${totalDownloads.toLocaleString()} |`,
+						].join("\n");
+					}),
+				);
+
+				const output = [`## Download Trends`, ...sections].join("\n\n---\n\n");
+				return { content: [{ type: "text" as const, text: output }] };
+			},
+		);
+
+		// ── Tool 9: github_stats ─────────────────────────────────────────────────
+		this.server.registerTool(
+			"github_stats",
+			{
+				description:
+					"Get GitHub stats for npm packages: stars, forks, open issues, contributors, commit frequency, watchers. Shows community health at a glance.",
+				inputSchema: {
+					packages: z
+						.array(z.string())
+						.min(1)
+						.max(6)
+						.describe("Package names, e.g. ['axios', 'got']"),
+				},
+			},
+			async ({ packages }) => {
+				const results = await Promise.all(
+					packages.map(async (name) => {
+						const data = await getNpmsDataFull(name);
+						return { name, data };
+					}),
+				);
+
+				// Summary table
+				const tableHeader = [
+					`## GitHub Stats`,
+					`| Package | ⭐ Stars | 🍴 Forks | 👁 Watchers | 🐛 Open Issues | 👥 Contributors | Commit Freq |`,
+					`|---------|---------|---------|-----------|--------------|----------------|------------|`,
+				];
+
+				const tableRows = results.map(({ name, data }) => {
+					const gh = data?.collected?.github;
+					if (!gh) return `| **${name}** | N/A | N/A | N/A | N/A | N/A | N/A |`;
+					const stars = gh.starsCount?.toLocaleString() ?? "?";
+					const forks = gh.forksCount?.toLocaleString() ?? "?";
+					const watchers = gh.subscribersCount?.toLocaleString() ?? "?";
+					const openIssues = gh.issues?.openCount?.toLocaleString() ?? "?";
+					const contributors = gh.contributors?.length?.toLocaleString() ?? "?";
+					// Commits in last period
+					const commitCount = gh.commits?.reduce((s, c) => s + c.count, 0) ?? 0;
+					const commitFreq = commitCount > 50 ? "🔥 Very Active" : commitCount > 20 ? "✅ Active" : commitCount > 5 ? "🟡 Moderate" : "🔴 Low";
+					return `| **${name}** | ${stars} | ${forks} | ${watchers} | ${openIssues} | ${contributors} | ${commitFreq} |`;
+				});
+
+				// Detailed sections
+				const details = results.map(({ name, data }) => {
+					const gh = data?.collected?.github;
+					const npm = data?.collected?.npm;
+					if (!gh && !npm) return `### ${name}\n> No GitHub data available`;
+
+					const topContributors = (gh?.contributors ?? [])
+						.slice(0, 5)
+						.map((c) => `${c.username} (${c.commitsCount} commits)`)
+						.join(", ");
+
+					const issueRatio =
+						gh?.issues?.count && gh?.issues?.openCount
+							? `${((gh.issues.openCount / gh.issues.count) * 100).toFixed(0)}% open`
+							: "N/A";
+
+					return [
+						`### ${name}`,
+						gh?.starsCount !== undefined ? `- ⭐ **Stars:** ${gh.starsCount.toLocaleString()}` : "",
+						gh?.forksCount !== undefined ? `- 🍴 **Forks:** ${gh.forksCount.toLocaleString()}` : "",
+						gh?.subscribersCount !== undefined ? `- 👁 **Watchers:** ${gh.subscribersCount.toLocaleString()}` : "",
+						gh?.issues ? `- 🐛 **Issues:** ${gh.issues.openCount} open / ${gh.issues.count} total (${issueRatio})` : "",
+						topContributors ? `- 👥 **Top contributors:** ${topContributors}` : "",
+						npm?.starsCount !== undefined ? `- 📦 **npm stars:** ${npm.starsCount.toLocaleString()}` : "",
+					]
+						.filter(Boolean)
+						.join("\n");
+				});
+
+				const output = [
+					[...tableHeader, ...tableRows].join("\n"),
+					"---",
+					"## Details",
+					...details,
+				].join("\n\n");
+
+				return { content: [{ type: "text" as const, text: output }] };
+			},
+		);
+
+		// ── Tool 10: bundle_cost_analyzer ────────────────────────────────────────
+		this.server.registerTool(
+			"bundle_cost_analyzer",
+			{
+				description:
+					"Calculate the total bundle cost of adding multiple npm packages to your project. Shows individual and combined gzip size, raw size, dependency count, and estimated load time on 3G/4G/WiFi.",
+				inputSchema: {
+					packages: z
+						.array(z.string())
+						.min(1)
+						.max(10)
+						.describe("Package names to analyze, e.g. ['lodash', 'moment', 'axios']"),
+				},
+			},
+			async ({ packages }) => {
+				const results = await Promise.all(
+					packages.map(async (name) => {
+						const bundle = await getBundleSize(name);
+						return { name, bundle };
+					}),
+				);
+
+				const found = results.filter((r) => r.bundle !== null);
+				const totalGzip = found.reduce((s, r) => s + (r.bundle?.gzip ?? 0), 0);
+				const totalRaw = found.reduce((s, r) => s + (r.bundle?.size ?? 0), 0);
+				const totalDeps = found.reduce((s, r) => s + (r.bundle?.dependencyCount ?? 0), 0);
+
+				// Budget thresholds
+				const budgetLabel =
+					totalGzip < 30 * 1024
+						? "✅ Lightweight"
+						: totalGzip < 100 * 1024
+							? "🟡 Moderate"
+							: totalGzip < 250 * 1024
+								? "🟠 Heavy"
+								: "🔴 Very Heavy";
+
+				const tableHeader = [
+					`## Bundle Cost Analysis`,
+					`| Package | Raw Size | Gzip Size | Deps | Load time (3G/4G/WiFi) |`,
+					`|---------|----------|-----------|------|----------------------|`,
+				];
+
+				const tableRows = results.map(({ name, bundle }) => {
+					if (!bundle) return `| **${name}** | N/A | N/A | N/A | N/A |`;
+					return `| **${name}** | ${formatBytes(bundle.size)} | ${formatBytes(bundle.gzip)} | ${bundle.dependencyCount} | ${loadTimeMs(bundle.gzip)} |`;
+				});
+
+				const summary = [
+					``,
+					`### Total Bundle Impact`,
+					`| Metric | Value |`,
+					`|--------|-------|`,
+					`| Combined raw | ${formatBytes(totalRaw)} |`,
+					`| Combined gzip | **${formatBytes(totalGzip)}** |`,
+					`| Total deps pulled in | ${totalDeps} |`,
+					`| Load time (3G) | ~${((totalGzip / (1000 * 1000 / 8)) * 1000).toFixed(0)}ms |`,
+					`| Load time (4G) | ~${((totalGzip / (10 * 1000 * 1000 / 8)) * 1000).toFixed(0)}ms |`,
+					`| Load time (WiFi) | ~${((totalGzip / (50 * 1000 * 1000 / 8)) * 1000).toFixed(0)}ms |`,
+					`| Budget rating | ${budgetLabel} |`,
+					``,
+					`> **Tip:** Keep total gzip under 30kB for fast initial load. Consider lazy-loading heavy packages.`,
+				].join("\n");
+
+				const output = [[...tableHeader, ...tableRows].join("\n"), summary].join("\n");
+				return { content: [{ type: "text" as const, text: output }] };
+			},
+		);
+
+		// ── Tool 11: package_version_history ─────────────────────────────────────
+		this.server.registerTool(
+			"package_version_history",
+			{
+				description:
+					"Show the full version release history of an npm package: release dates, frequency, how long between versions, and whether development is active or stalled.",
+				inputSchema: {
+					name: z.string().describe("Package name, e.g. 'react'"),
+					limit: z.number().min(5).max(30).default(15).describe("Number of recent versions to show"),
+				},
+			},
+			async ({ name, limit }) => {
+				const registry = await getNpmRegistry(name);
+				if (!registry) {
+					return { content: [{ type: "text" as const, text: `Package "${name}" not found.` }] };
+				}
+
+				const latest = registry["dist-tags"]?.latest;
+				const allVersions = Object.keys(registry.time)
+					.filter((v) => v !== "created" && v !== "modified" && registry.time[v])
+					.sort((a, b) => new Date(registry.time[b]!).getTime() - new Date(registry.time[a]!).getTime())
+					.slice(0, limit);
+
+				const rows = allVersions.map((v, i) => {
+					const date = new Date(registry.time[v]!);
+					const dateStr = date.toISOString().split("T")[0];
+					const isLatest = v === latest ? " 👈 latest" : "";
+					const isStable = isStableVersion(v) ? "✅" : "⚠️ pre";
+					const deprecated = registry.versions[v]?.deprecated ? " 🗑️ deprecated" : "";
+
+					// Days since previous release
+					let daysSince = "";
+					if (i < allVersions.length - 1) {
+						const prevDate = new Date(registry.time[allVersions[i + 1]!]!);
+						const days = Math.round((date.getTime() - prevDate.getTime()) / (1000 * 60 * 60 * 24));
+						daysSince = days > 0 ? `${days}d` : "<1d";
+					}
+
+					return `| \`${v}\`${isLatest}${deprecated} | ${dateStr} | ${isStable} | ${daysSince} |`;
+				});
+
+				// Release frequency stats
+				const timestamps = allVersions
+					.map((v) => new Date(registry.time[v]!).getTime())
+					.sort((a, b) => b - a);
+				const intervals = timestamps
+					.slice(0, -1)
+					.map((t, i) => Math.round((t - timestamps[i + 1]!) / (1000 * 60 * 60 * 24)));
+				const avgInterval = intervals.length
+					? Math.round(intervals.reduce((a, b) => a + b, 0) / intervals.length)
+					: 0;
+
+				const totalVersions = Object.keys(registry.versions).length;
+				const created = registry.time["created"] ? new Date(registry.time["created"]).toISOString().split("T")[0] : "?";
+				const lastModified = registry.time["modified"] ? new Date(registry.time["modified"]).toISOString().split("T")[0] : "?";
+
+				const activityLabel =
+					avgInterval < 7
+						? "🔥 Very frequent (< weekly)"
+						: avgInterval < 30
+							? "✅ Regular (monthly-ish)"
+							: avgInterval < 90
+								? "🟡 Infrequent (quarterly-ish)"
+								: "🔴 Rare releases";
+
+				const output = [
+					`## Version History: ${name}`,
+					``,
+					`| Metric | Value |`,
+					`|--------|-------|`,
+					`| Total versions | ${totalVersions} |`,
+					`| Latest | v${latest} |`,
+					`| First release | ${created} |`,
+					`| Last modified | ${lastModified} |`,
+					`| Avg days between releases | ${avgInterval} days |`,
+					`| Release cadence | ${activityLabel} |`,
+					``,
+					`### Recent ${allVersions.length} Versions`,
+					`| Version | Released | Stable | Gap |`,
+					`|---------|----------|--------|-----|`,
+					...rows,
+				].join("\n");
+
+				return { content: [{ type: "text" as const, text: output }] };
+			},
+		);
+
+		// ── Tool 12: find_zero_dep_packages ──────────────────────────────────────
+		this.server.registerTool(
+			"find_zero_dep_packages",
+			{
+				description:
+					"Find npm packages with zero (or very few) dependencies for a given use case. Perfect when you want minimal bloat and no transitive dependency hell.",
+				inputSchema: {
+					query: z.string().describe("What you need, e.g. 'date formatting', 'UUID generation', 'deep clone object'"),
+					max_deps: z.number().min(0).max(5).default(0).describe("Maximum number of dependencies allowed (default 0 = zero-dep only)"),
+				},
+			},
+			async ({ query, max_deps }) => {
+				const data = await fetchJson<{ results: NpmsPackage[]; total: number }>(
+					`https://api.npms.io/v2/search?q=${encodeURIComponent(query)}&size=15`,
+				);
+
+				if (!data || data.results.length === 0) {
+					return { content: [{ type: "text" as const, text: `No packages found for: "${query}"` }] };
+				}
+
+				// Fetch bundle info to check dep count
+				const enriched = await Promise.all(
+					data.results.map(async (r) => {
+						const [bundle, registry] = await Promise.all([
+							getBundleSize(r.package.name),
+							getNpmRegistry(r.package.name),
+						]);
+						const depCount = Object.keys(
+							registry?.versions?.[registry?.["dist-tags"]?.latest ?? ""]?.dependencies ?? {},
+						).length;
+						return { r, bundle, registry, depCount };
+					}),
+				);
+
+				const filtered = enriched
+					.filter(({ depCount }) => depCount <= max_deps)
+					.sort((a, b) => b.r.score.final - a.r.score.final)
+					.slice(0, 6);
+
+				if (filtered.length === 0) {
+					const allDeps = enriched
+						.sort((a, b) => a.depCount - b.depCount)
+						.slice(0, 3)
+						.map(({ r, depCount }) => `- **${r.package.name}** — ${depCount} deps, score: ${(r.score.final * 100).toFixed(0)}/100`)
+						.join("\n");
+					return {
+						content: [{
+							type: "text" as const,
+							text: `## Zero-dep search: "${query}"\n\nNo packages found with ≤${max_deps} dependencies. Lowest-dep options:\n\n${allDeps}`,
+						}],
+					};
+				}
+
+				const tableHeader = [
+					`## Zero-Dep Packages for: "${query}"`,
+					`> Showing packages with **≤${max_deps} dependencies** — minimal bloat guaranteed\n`,
+					`| Package | Version | Score | Bundle (gzip) | Deps | License |`,
+					`|---------|---------|-------|--------------|------|---------|`,
+				];
+
+				const tableRows = filtered.map(({ r, bundle, registry, depCount }) => {
+					const latest = registry?.["dist-tags"]?.latest ?? r.package.version;
+					const license = registry?.license ?? "?";
+					const bundleStr = bundle ? formatBytes(bundle.gzip) : "N/A";
+					return `| **${r.package.name}** | ${latest} | ${(r.score.final * 100).toFixed(0)}/100 | ${bundleStr} | ${depCount} | ${license} |`;
+				});
+
+				const cards = filtered.map(({ r, registry }) => {
+					const latest = registry?.["dist-tags"]?.latest ?? r.package.version;
+					const lastPub = registry?.time?.[latest] ?? r.package.date;
+					return [
+						`### ${r.package.name}@${latest}`,
+						r.package.description ?? "",
+						`- **Score:** ${(r.score.final * 100).toFixed(0)}/100 | **npm:** ${r.package.links.npm}`,
+						`- **Published:** ${monthsAgo(lastPub)}`,
+						r.package.links.repository ? `- **Repo:** ${r.package.links.repository}` : "",
+					].filter(Boolean).join("\n");
+				});
+
+				const output = [
+					[...tableHeader, ...tableRows].join("\n"),
+					"---",
+					"## Package Details",
+					...cards,
+				].join("\n\n---\n\n");
+
+				return { content: [{ type: "text" as const, text: output }] };
+			},
+		);
+
+		// ── Tool 13: peer_dep_checker ────────────────────────────────────────────
+		this.server.registerTool(
+			"peer_dep_checker",
+			{
+				description:
+					"Check your project's package.json for unsatisfied peer dependencies. Finds missing packages, version mismatches, and tells you exactly what to install to fix them.",
+				inputSchema: {
+					package_json: z.string().describe("Full contents of your package.json"),
+				},
+			},
+			async ({ package_json }) => {
+				let parsed: {
+					dependencies?: Record<string, string>;
+					devDependencies?: Record<string, string>;
+					name?: string;
+				};
+				try {
+					parsed = JSON.parse(package_json);
+				} catch {
+					return { content: [{ type: "text" as const, text: "Invalid JSON." }] };
+				}
+
+				const allInstalled = {
+					...parsed.dependencies,
+					...parsed.devDependencies,
+				};
+				const packageNames = Object.keys(allInstalled).slice(0, 25);
+
+				// Fetch peer deps for each installed package
+				const peerResults = await Promise.all(
+					packageNames.map(async (name) => {
+						const registry = await getNpmRegistry(name);
+						const latest = registry?.["dist-tags"]?.latest;
+						const peers = registry?.versions?.[latest ?? ""]?.peerDependencies ?? {};
+						return { name, peers };
+					}),
+				);
+
+				type Issue = { pkg: string; peer: string; required: string; installed: string | null; status: "missing" | "mismatch" | "ok" };
+				const issues: Issue[] = [];
+
+				for (const { name, peers } of peerResults) {
+					for (const [peer, required] of Object.entries(peers)) {
+						const installedVersion = allInstalled[peer] ?? null;
+						if (!installedVersion) {
+							issues.push({ pkg: name, peer, required, installed: null, status: "missing" });
+						} else if (!satisfiesRange(installedVersion, required)) {
+							issues.push({ pkg: name, peer, required, installed: installedVersion, status: "mismatch" });
+						}
+					}
+				}
+
+				const missing = issues.filter((i) => i.status === "missing");
+				const mismatches = issues.filter((i) => i.status === "mismatch");
+
+				if (issues.length === 0) {
+					return {
+						content: [{
+							type: "text" as const,
+							text: `## Peer Dependency Check: ${parsed.name ?? "project"}\n\n✅ **All peer dependencies are satisfied!** No issues found across ${packageNames.length} packages.`,
+						}],
+					};
+				}
+
+				const lines = [
+					`## Peer Dependency Check: ${parsed.name ?? "project"}`,
+					`Checked **${packageNames.length}** packages — found **${issues.length}** peer dep issue(s)\n`,
+					missing.length > 0
+						? [
+							`### ❌ Missing Peer Dependencies (${missing.length})`,
+							`| Required by | Peer Package | Required Version |`,
+							`|-------------|-------------|-----------------|`,
+							...missing.map((i) => `| \`${i.pkg}\` | \`${i.peer}\` | \`${i.required}\` |`),
+							`\n**Install missing:**`,
+							`\`\`\``,
+							`npm install ${missing.map((i) => i.peer).filter((v, i, a) => a.indexOf(v) === i).join(" ")}`,
+							`\`\`\``,
+						].join("\n")
+						: "",
+					mismatches.length > 0
+						? [
+							`### ⚠️ Version Mismatches (${mismatches.length})`,
+							`| Required by | Peer Package | Needs | You have |`,
+							`|-------------|-------------|-------|---------|`,
+							...mismatches.map((i) => `| \`${i.pkg}\` | \`${i.peer}\` | \`${i.required}\` | \`${i.installed}\` |`),
+						].join("\n")
+						: "",
+				].filter(Boolean).join("\n\n");
+
+				return { content: [{ type: "text" as const, text: lines }] };
+			},
+		);
+
+		// ── Tool 14: tech_stack_builder ──────────────────────────────────────────
+		this.server.registerTool(
+			"tech_stack_builder",
+			{
+				description:
+					"Describe what you're building and get a curated full npm tech stack recommendation. Covers HTTP, validation, database/ORM, auth, testing, logging, and more — with the best-scored package for each layer.",
+				inputSchema: {
+					description: z
+						.string()
+						.describe("What you're building, e.g. 'REST API with PostgreSQL', 'React dashboard with charts', 'CLI tool'"),
+					runtime: z
+						.enum(["node", "browser", "both"])
+						.default("node")
+						.describe("Target runtime"),
+				},
+			},
+			async ({ description, runtime }) => {
+				const isNode = runtime === "node" || runtime === "both";
+				const isBrowser = runtime === "browser" || runtime === "both";
+				const desc = description.toLowerCase();
+
+				// Determine relevant layers based on description
+				const layers: { name: string; query: string; emoji: string }[] = [];
+
+				// HTTP / framework
+				if (desc.includes("rest") || desc.includes("api") || desc.includes("server") || desc.includes("backend")) {
+					layers.push({ name: "HTTP Framework", query: "node http web framework", emoji: "🌐" });
+				}
+				if (desc.includes("react") || desc.includes("dashboard") || desc.includes("frontend") || isBrowser) {
+					layers.push({ name: "UI Framework / Components", query: "react component library ui", emoji: "🎨" });
+				}
+				if (desc.includes("cli") || desc.includes("command line")) {
+					layers.push({ name: "CLI Framework", query: "node cli command line parser", emoji: "⌨️" });
+					layers.push({ name: "CLI Prompts / UX", query: "interactive cli prompts terminal", emoji: "💬" });
+				}
+
+				// Database
+				if (desc.includes("postgres") || desc.includes("postgresql") || desc.includes("sql")) {
+					layers.push({ name: "PostgreSQL Client / ORM", query: "postgresql node orm database", emoji: "🗄️" });
+				} else if (desc.includes("mongo")) {
+					layers.push({ name: "MongoDB ODM", query: "mongodb node odm", emoji: "🗄️" });
+				} else if (desc.includes("database") || desc.includes("db") || desc.includes("orm")) {
+					layers.push({ name: "ORM / Query Builder", query: "node orm database query builder", emoji: "🗄️" });
+				}
+
+				// Validation
+				if (desc.includes("api") || desc.includes("form") || desc.includes("input") || desc.includes("schema")) {
+					layers.push({ name: "Schema Validation", query: "schema validation typescript", emoji: "✅" });
+				}
+
+				// Auth
+				if (desc.includes("auth") || desc.includes("jwt") || desc.includes("login") || desc.includes("oauth")) {
+					layers.push({ name: "Authentication / JWT", query: "node authentication jwt", emoji: "🔐" });
+				}
+
+				// HTTP client
+				if (desc.includes("fetch") || desc.includes("http client") || desc.includes("api client") || isBrowser) {
+					layers.push({ name: "HTTP Client", query: "http client fetch request", emoji: "📡" });
+				}
+
+				// Charts
+				if (desc.includes("chart") || desc.includes("graph") || desc.includes("visualization") || desc.includes("dashboard")) {
+					layers.push({ name: "Charts / Data Viz", query: "javascript chart visualization library", emoji: "📊" });
+				}
+
+				// Testing
+				layers.push({ name: "Testing Framework", query: isNode ? "node testing framework jest vitest" : "javascript browser testing", emoji: "🧪" });
+
+				// Logging
+				if (isNode) {
+					layers.push({ name: "Logging", query: "node logging structured logger", emoji: "📝" });
+				}
+
+				// Date/time
+				if (desc.includes("date") || desc.includes("time") || desc.includes("schedule") || desc.includes("cron")) {
+					layers.push({ name: "Date / Time", query: "javascript date time manipulation", emoji: "📅" });
+				}
+
+				// Env / config
+				if (isNode) {
+					layers.push({ name: "Environment / Config", query: "node environment variables config dotenv", emoji: "⚙️" });
+				}
+
+				// TypeScript utils
+				layers.push({ name: "TypeScript Utility Types", query: "typescript utility types helpers", emoji: "🔧" });
+
+				// Search top result for each layer
+				const recommendations = await Promise.all(
+					layers.map(async ({ name, query, emoji }) => {
+						const data = await fetchJson<{ results: NpmsPackage[] }>(
+							`https://api.npms.io/v2/search?q=${encodeURIComponent(query)}&size=3`,
+						);
+						const top = data?.results?.[0];
+						if (!top) return { layer: name, emoji, pkg: null };
+
+						const [registry, downloads] = await Promise.all([
+							getNpmRegistry(top.package.name),
+							getWeeklyDownloads(top.package.name),
+						]);
+						const latest = registry?.["dist-tags"]?.latest ?? top.package.version;
+						const license = registry?.license ?? "?";
+
+						return {
+							layer: name,
+							emoji,
+							pkg: {
+								name: top.package.name,
+								version: latest,
+								score: top.score.final,
+								downloads,
+								license,
+								description: top.package.description,
+								npm: top.package.links.npm,
+							},
+						};
+					}),
+				);
+
+				const tableHeader = [
+					`## Tech Stack for: "${description}"`,
+					`> Runtime: **${runtime}** | ${recommendations.filter((r) => r.pkg).length} layers covered\n`,
+					`| Layer | Package | Version | Score | Downloads/wk | License |`,
+					`|-------|---------|---------|-------|-------------|---------|`,
+				];
+
+				const tableRows = recommendations.map(({ layer, emoji, pkg }) => {
+					if (!pkg) return `| ${emoji} ${layer} | N/A | N/A | N/A | N/A | N/A |`;
+					const dl = pkg.downloads?.toLocaleString() ?? "N/A";
+					return `| ${emoji} **${layer}** | \`${pkg.name}\` | ${pkg.version} | ${(pkg.score * 100).toFixed(0)}/100 | ${dl} | ${pkg.license} |`;
+				});
+
+				const installList = recommendations
+					.filter((r) => r.pkg)
+					.map((r) => r.pkg!.name)
+					.join(" ");
+
+				const footer = [
+					``,
+					`---`,
+					`### Install everything`,
+					`\`\`\`bash`,
+					`npm install ${installList}`,
+					`\`\`\``,
+					``,
+					`> Scores from [npms.io](https://npms.io) — reflects quality, popularity, and maintenance.`,
+				].join("\n");
+
+				const output = [[...tableHeader, ...tableRows].join("\n"), footer].join("\n");
+				return { content: [{ type: "text" as const, text: output }] };
+			},
+		);
 	}
 }
 
@@ -1011,6 +1748,13 @@ export default {
 					"check_alternatives",
 					"scan_project_deps",
 					"smart_upgrade_advisor",
+					"download_trends",
+					"github_stats",
+					"bundle_cost_analyzer",
+					"package_version_history",
+					"find_zero_dep_packages",
+					"peer_dep_checker",
+					"tech_stack_builder",
 				],
 			}),
 			{ status: 200, headers: { "Content-Type": "application/json" } },
